@@ -223,6 +223,72 @@ def install_happy_eyeballs_socket_connect() -> None:
     elif not any(isinstance(finder, _Urllib3ConnectionPatcher) for finder in sys.meta_path):
         sys.meta_path.insert(0, _Urllib3ConnectionPatcher())
 
+    install_tailscale_mtu_clamp()
+
+
+def install_tailscale_mtu_clamp() -> None:
+    """Clamp outbound TCP segment payloads to Tailscale IPs (100.64.0.0/10 and fd7a::/16).
+
+    Direct peer-to-peer WireGuard connections over IPv6 through some ISPs (e.g., Telkom Indonesia PPPoE)
+    have a Path MTU of ~1250 bytes. The virtual Tailscale adapter MTU defaults to 1280, producing
+    1240-byte TCP segments. When encapsulated in IPv6 + UDP + WireGuard (80 bytes overhead), the outer
+    packet reaches ~1320 bytes and is silently dropped by the ISP router without ICMP feedback.
+    This causes any payload > 1KB (such as LLM requests with tools and system prompt) to hang and time out.
+
+    By clamping socket.send and socket.sendall to 1000-byte chunks with TCP_NODELAY and a 5ms pacing interval,
+    all packets stay strictly within the path MTU limit without needing elevated admin privileges to modify
+    the system adapter MTU.
+    """
+    if getattr(socket.socket, "_hermes_tailscale_clamped", False):
+        return
+
+    orig_send = socket.socket.send
+    orig_sendall = socket.socket.sendall
+
+    def _is_tailscale_peer(sock: socket.socket) -> bool:
+        try:
+            peer = sock.getpeername()
+            if isinstance(peer, tuple) and isinstance(peer[0], str):
+                addr = peer[0]
+                return addr.startswith("100.") or addr.startswith("fd7a:")
+        except Exception:
+            pass
+        return False
+
+    def _clamped_send(self, data, flags=0):
+        if _is_tailscale_peer(self):
+            try:
+                self.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            if len(data) > 1000:
+                chunk = data[:1000]
+                n = orig_send(self, chunk, flags)
+                time.sleep(0.005)
+                return n
+        return orig_send(self, data, flags)
+
+    def _clamped_sendall(self, data, flags=0):
+        if _is_tailscale_peer(self):
+            try:
+                self.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            chunk_size = 1000
+            for i in range(0, len(data), chunk_size):
+                chunk = data[i:i + chunk_size]
+                orig_sendall(self, chunk, flags)
+                if i + chunk_size < len(data):
+                    time.sleep(0.005)
+            return None
+        return orig_sendall(self, data, flags)
+
+    _clamped_send._hermes_tailscale_clamped = True  # type: ignore[attr-defined]
+    _clamped_sendall._hermes_tailscale_clamped = True  # type: ignore[attr-defined]
+    socket.socket.send = _clamped_send
+    socket.socket.sendall = _clamped_sendall
+    socket.socket._hermes_tailscale_clamped = True  # type: ignore[attr-defined]
+
 
 def apply_windows_utf8_bootstrap() -> bool:
     """Apply the Windows UTF-8 bootstrap once; True only when it was applied this call."""
