@@ -235,3 +235,122 @@ class TestCustomResponsesEffortVocabulary:
             },
         )
         assert (effort, enabled) == ("xhigh", True)
+
+
+class TestCustomSystemPromptMode:
+    """Opt-in prompt-role rewriting for custom/relay endpoints (#76783)."""
+
+    def test_default_system_prompt_mode_is_system(self, custom_profile):
+        """By default, custom profile preserves system role without rewriting."""
+        assert custom_profile.system_prompt_mode == "system"
+
+    def test_default_mode_preserves_large_system_prompt(self, custom_profile):
+        """Default 'system' mode leaves large system prompt (>400 chars) byte-stable."""
+        long_system = "You are Hermes Agent. Instructions: " + ("abcdef123456 " * 40)
+        assert len(long_system) > 400
+        msgs = [
+            {"role": "system", "content": long_system},
+            {"role": "user", "content": "Help me code"},
+        ]
+        prepared = custom_profile.prepare_messages(msgs)
+        assert prepared == msgs
+        assert prepared[0]["role"] == "system"
+        assert prepared[0]["content"] == long_system
+        assert prepared[1]["role"] == "user"
+        assert "<hermes_instructions>" not in str(prepared)
+
+    def test_opt_in_user_mode_leaves_short_system_prompt(self, custom_profile):
+        """When system_prompt_mode='user', short system prompts (<= 400 chars) are untouched."""
+        from dataclasses import replace
+
+        user_mode_profile = replace(custom_profile, system_prompt_mode="user")
+        short_system = "You are a helpful assistant."
+        msgs = [
+            {"role": "system", "content": short_system},
+            {"role": "user", "content": "Hello"},
+        ]
+        prepared = user_mode_profile.prepare_messages(msgs)
+        assert prepared == msgs
+
+    def test_opt_in_user_mode_rewrites_long_system_prompt_into_user_turn(self, custom_profile):
+        """When system_prompt_mode='user', system prompts > 400 chars are moved to user turn."""
+        from dataclasses import replace
+
+        user_mode_profile = replace(custom_profile, system_prompt_mode="user")
+        long_system = "You are Hermes Agent. Detailed instructions: " + ("rule_line_xyz " * 35)
+        assert len(long_system) > 400
+        msgs = [
+            {"role": "system", "content": long_system},
+            {"role": "user", "content": "User task here"},
+        ]
+        prepared = user_mode_profile.prepare_messages(msgs)
+        assert len(prepared) == 2
+        assert prepared[0]["role"] == "system"
+        assert prepared[0]["content"] == "You are Hermes Agent. Follow the instructions provided."
+        assert prepared[1]["role"] == "user"
+        assert f"<hermes_instructions>\n{long_system}\n</hermes_instructions>\n\nUser task here" == prepared[1]["content"]
+
+    def test_opt_in_user_mode_multipart_user_content(self, custom_profile):
+        """When first user message is multipart list, instructions part is prepended."""
+        from dataclasses import replace
+
+        user_mode_profile = replace(custom_profile, system_prompt_mode="user")
+        long_system = "Long instructions: " + ("important_rule " * 35)
+        assert len(long_system) > 400
+        msgs = [
+            {"role": "system", "content": long_system},
+            {"role": "user", "content": [{"type": "text", "text": "Part 1"}]},
+        ]
+        prepared = user_mode_profile.prepare_messages(msgs)
+        assert prepared[0]["role"] == "system"
+        assert prepared[1]["role"] == "user"
+        content_parts = prepared[1]["content"]
+        assert isinstance(content_parts, list)
+        assert content_parts[0]["type"] == "text"
+        assert f"<hermes_instructions>\n{long_system}\n</hermes_instructions>\n\n" == content_parts[0]["text"]
+        assert content_parts[1]["text"] == "Part 1"
+
+    def test_opt_in_user_mode_no_user_message(self, custom_profile):
+        """When no user message exists, a new user message is created."""
+        from dataclasses import replace
+
+        user_mode_profile = replace(custom_profile, system_prompt_mode="user")
+        long_system = "Long instructions: " + ("no_user_msg_rule " * 35)
+        assert len(long_system) > 400
+        msgs = [{"role": "system", "content": long_system}]
+        prepared = user_mode_profile.prepare_messages(msgs)
+        assert len(prepared) == 2
+        assert prepared[0]["role"] == "system"
+        assert prepared[0]["content"] == "You are Hermes Agent. Follow the instructions provided."
+        assert prepared[1]["role"] == "user"
+        assert prepared[1]["content"] == f"<hermes_instructions>\n{long_system}\n</hermes_instructions>"
+
+    def test_chat_completions_transport_honours_system_prompt_mode_override(self, custom_profile):
+        """ChatCompletionsTransport applies system_prompt_mode override from params/request_overrides."""
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        long_system = "System prompt: " + ("long_instruction_detail " * 25)
+        assert len(long_system) > 400
+        msgs = [
+            {"role": "system", "content": long_system},
+            {"role": "user", "content": "Execute task"},
+        ]
+        transport = ChatCompletionsTransport()
+
+        # Default custom profile -> preserves system
+        kw_default = transport.build_kwargs(
+            model="custom-model", messages=msgs, provider_profile=custom_profile
+        )
+        assert kw_default["messages"][0]["role"] == "system"
+        assert kw_default["messages"][0]["content"] == long_system
+        assert "<hermes_instructions>" not in kw_default["messages"][1]["content"]
+
+        # Opt-in override -> rewrites
+        kw_user = transport.build_kwargs(
+            model="custom-model", messages=msgs, provider_profile=custom_profile,
+            system_prompt_mode="user",
+        )
+        assert kw_user["messages"][0]["role"] == "system"
+        assert kw_user["messages"][0]["content"] == "You are Hermes Agent. Follow the instructions provided."
+        assert "<hermes_instructions>" in kw_user["messages"][1]["content"]
+

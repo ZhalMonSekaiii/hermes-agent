@@ -558,6 +558,10 @@ class ChatCompletionsTransport(ProviderTransport):
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):
         """Build API kwargs from a ProviderProfile — every quirk comes from the profile object."""
+        prompt_mode = params.get("system_prompt_mode") or (params.get("request_overrides") or {}).get("system_prompt_mode")
+        if prompt_mode and hasattr(profile, "system_prompt_mode") and profile.system_prompt_mode != prompt_mode:
+            from dataclasses import replace
+            profile = replace(profile, system_prompt_mode=str(prompt_mode).strip().lower())
         sanitized = _swap_developer_role(profile.prepare_messages(sanitized), (model or "").lower())
         api_kwargs = _base_kwargs(model, sanitized, tools, params, profile=profile)
 

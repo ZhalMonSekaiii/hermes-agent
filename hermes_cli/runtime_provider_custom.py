@@ -112,6 +112,9 @@ def _lift_common_custom_fields(entry: Dict[str, Any], result: Dict[str, Any], *,
     _lift_extra_headers(entry, result)
     if api_mode:
         result["api_mode"] = api_mode
+    system_prompt_mode = entry.get("system_prompt_mode")
+    if system_prompt_mode:
+        result["system_prompt_mode"] = str(system_prompt_mode).strip().lower()
 
     _lift_model_capabilities(entry, None, result)
 
@@ -419,6 +422,8 @@ def _apply_custom_provider_extras(custom_provider: Dict[str, Any], target_model:
 
     if custom_provider.get("extra_headers"):
         result["extra_headers"] = dict(custom_provider["extra_headers"])
+    if custom_provider.get("system_prompt_mode"):
+        result["system_prompt_mode"] = str(custom_provider["system_prompt_mode"]).strip().lower()
     request_overrides = _custom_provider_request_overrides(custom_provider)
     if request_overrides:
         result["request_overrides"] = {**(result.get("request_overrides") or {}), **request_overrides}

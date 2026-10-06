@@ -38,6 +38,37 @@ def _profile_user_agent() -> str:
         return "hermes-cli"
 
 
+def _rewrite_system_prompt_to_user(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Avoid false 429 RESOURCE_EXHAUSTED from huge systemInstruction on proxies (#76783)."""
+    if not messages or not isinstance(messages, list):
+        return messages
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") == "system":
+        system_text = str(first.get("content") or "")
+        # If system prompt is large (> 400 chars), keep identity in system and move instructions to first user turn
+        if len(system_text) > 400:
+            new_messages = [{"role": "system", "content": "You are Hermes Agent. Follow the instructions provided."}]
+            rest = messages[1:]
+            if rest and isinstance(rest[0], dict) and rest[0].get("role") == "user":
+                first_user = rest[0]
+                user_content = first_user.get("content")
+                if isinstance(user_content, str):
+                    new_content = f"<hermes_instructions>\n{system_text}\n</hermes_instructions>\n\n{user_content}"
+                    new_messages.append({**first_user, "content": new_content})
+                    new_messages.extend(rest[1:])
+                    return new_messages
+                elif isinstance(user_content, list):
+                    new_content = [{"type": "text", "text": f"<hermes_instructions>\n{system_text}\n</hermes_instructions>\n\n"}] + list(user_content)
+                    new_messages.append({**first_user, "content": new_content})
+                    new_messages.extend(rest[1:])
+                    return new_messages
+            else:
+                new_messages.append({"role": "user", "content": f"<hermes_instructions>\n{system_text}\n</hermes_instructions>"})
+                new_messages.extend(rest)
+                return new_messages
+    return messages
+
+
 @dataclass
 class ProviderProfile:
     """Base provider profile — subclass or instantiate with overrides."""
@@ -143,6 +174,11 @@ class ProviderProfile:
     # patch catalog metadata; explicit user overrides still win. Exact model IDs.
     model_capabilities: dict[str, dict[str, Any]] = field(default_factory=dict)
 
+    # System prompt role handling: "system" (default: native system instructions) or
+    # "user" (opt-in compatibility mode: embeds long system instructions into the first
+    # user message for OpenAI-compatible proxies that reject large system prompts; #76783).
+    system_prompt_mode: str = "system"
+
     # ── Hooks (override in subclass for complex providers) ───
 
     def fetch_account_usage(
@@ -190,8 +226,13 @@ class ProviderProfile:
         """Provider-specific message preprocessing.
 
         Called AFTER codex field sanitization, BEFORE developer role swap.
-        Default: pass-through.
+        When system_prompt_mode == 'user', rewrites large system instructions into
+        the first user message (opt-in compatibility mode for proxies fronting
+        relays that 429 on large system instructions, #76783).
+        Default: pass-through ("system").
         """
+        if self.system_prompt_mode == "user":
+            return _rewrite_system_prompt_to_user(messages)
         return messages
 
     def build_extra_body(

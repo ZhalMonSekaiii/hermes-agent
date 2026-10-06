@@ -223,6 +223,16 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
     if profile is None and isinstance(name, str) and not is_custom_route:
         if _has_named_custom_provider(name, home, key):
             profile = lookup("custom")
+    if profile is not None and (is_custom_route or (isinstance(name, str) and _has_named_custom_provider(name, home, key))):
+        from hermes_cli.runtime_provider_custom import _get_named_custom_provider
+        try:
+            entry = _get_named_custom_provider(name)
+            mode = (entry.get("system_prompt_mode") or "").strip().lower() if entry else ""
+            if mode and mode != getattr(profile, "system_prompt_mode", "system"):
+                from dataclasses import replace
+                profile = replace(profile, system_prompt_mode=mode)
+        except Exception:
+            pass
     return profile
 
 

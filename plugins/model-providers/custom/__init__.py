@@ -30,6 +30,18 @@ def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
 
+    system_prompt_mode: str = "system"
+
+    def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Opt-in prompt-role rewriting for custom relays (#76783).
+
+        When system_prompt_mode == 'user', avoids false 429 RESOURCE_EXHAUSTED
+        from huge systemInstruction on proxies/relays fronting Gemini/Antigravity
+        by embedding long system instructions (>400 chars) into the first user turn.
+        Default is 'system' (preserve system role natively).
+        """
+        return super().prepare_messages(messages)
+
     def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...]:
         """The OpenAI-compat wire set, mirroring this profile's own chat-completions clamp.
 
