@@ -290,12 +290,30 @@ def _resolve_channel(result: dict, channel: str, co: _Checkout):
 
 
 def _branch_remote(co: _Checkout, selected_branch: str) -> str:
+    if not co.embedded:
+        configured = _git_stdout(["config", "--get", f"branch.{selected_branch}.remote"],
+                                 cwd=co.root, git=co.git)
+        if configured:
+            return configured
     official_ssh = (co.repository and co.repository.lower() == OFFICIAL_REPOSITORY.lower()
                     and co.origin.lower().startswith(("git@", "ssh://")))
     # The public official repo does not require the user's SSH credentials.
     # Forks must keep their own origin, including its authentication.
     return (f"https://github.com/{OFFICIAL_REPOSITORY}.git"
             if co.embedded or (official_ssh and selected_branch != "main") else "origin")
+
+
+def _remote_repository(co: _Checkout, remote: str) -> Optional[str]:
+    if co.embedded:
+        return OFFICIAL_REPOSITORY
+    if remote.startswith(("https://", "git@", "ssh://")):
+        match = _GITHUB_ORIGIN.fullmatch(remote)
+        return match[1] if match else None
+    url = _git_stdout(["remote", "get-url", remote], cwd=co.root, git=co.git)
+    if not url:
+        return None
+    match = _GITHUB_ORIGIN.fullmatch(url)
+    return match[1] if match else None
 
 
 def _heal_deleted_branch(branch_config_path: Path, desktop_config: dict) -> None:
@@ -306,7 +324,7 @@ def _heal_deleted_branch(branch_config_path: Path, desktop_config: dict) -> None
         atomic_json_write(branch_config_path, {**desktop_config, "branch": "main"})
 
 
-def _unhealable_reason(co: _Checkout, branch: str) -> Optional[str]:
+def _unhealable_reason(co: _Checkout, branch: str, remote: str = "origin") -> Optional[str]:
     """Why a branch the remote does not advertise must keep its pin; None when healing loses nothing.
 
     An empty ref advertisement cannot tell "merged and deleted upstream" from "never pushed":
@@ -318,7 +336,8 @@ def _unhealable_reason(co: _Checkout, branch: str) -> Optional[str]:
     local = f"refs/heads/{branch}"
     if not _git_ok(["rev-parse", "--verify", "--quiet", local], cwd=co.root, git=co.git):
         return None  # Nothing in this checkout to abandon.
-    if not (_git_ok(["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], cwd=co.root, git=co.git)
+    if not (_git_ok(["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}"], cwd=co.root, git=co.git)
+            or _git_ok(["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], cwd=co.root, git=co.git)
             or _git_ok(["config", "--get", f"branch.{branch}.merge"], cwd=co.root, git=co.git)):
         return "never-pushed"
     for base in ("refs/remotes/origin/main", "refs/heads/main"):
@@ -329,13 +348,14 @@ def _unhealable_reason(co: _Checkout, branch: str) -> Optional[str]:
     return "unmerged"  # Unknown merge state keeps the branch.
 
 
-def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
+def _behind_count(co: _Checkout, target: str, repository: str | None = None) -> tuple[int, list[dict]]:
     """``(behind, commits)`` for ``target``: local ancestry first, then the GitHub compare API."""
     if co.head == target or (not co.embedded and _git_ok(
             ["merge-base", "--is-ancestor", target, co.head], cwd=co.root, git=co.git)):
         return 0, []
-    if co.repository:
-        payload = _github_compare(co.head, target, co.repository)
+    repo = repository or co.repository
+    if repo:
+        payload = _github_compare(co.head, target, repo)
         ahead = (payload or {}).get("ahead_by")
         if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
             return ahead, (_quiet(lambda: _commits(payload), []) if ahead else [])
@@ -347,8 +367,9 @@ def _check_branch(result: dict, co: _Checkout, selected_branch: str, *,
     """Compare the checkout with ``selected_branch``'s remote tip, falling back to main if it was deleted."""
     result["branch"] = selected_branch
     remote = _branch_remote(co, selected_branch)
-    target, missing, failure = _branch_tip(co.repository, selected_branch, co.root, co.git, remote)
-    reason = _unhealable_reason(co, selected_branch) if missing and selected_branch != "main" else None
+    repo = _remote_repository(co, remote) or co.repository
+    target, missing, failure = _branch_tip(repo, selected_branch, co.root, co.git, remote)
+    reason = _unhealable_reason(co, selected_branch, remote) if missing and selected_branch != "main" else None
     if reason:
         detail = ("has never been pushed" if reason == "never-pushed"
                   else "is gone from the remote but has commits that are not in main")
@@ -365,7 +386,7 @@ def _check_branch(result: dict, co: _Checkout, selected_branch: str, *,
                       message=f"Could not resolve the remote branch tip: {failure}" if failure
                       else "Could not resolve the remote branch tip.")
         return
-    behind, commits = _behind_count(co, target)
+    behind, commits = _behind_count(co, target, repo)
     result["commits"] = commits
     result.update(targetSha=target, behind=behind, updateAvailable=behind != 0)
 
